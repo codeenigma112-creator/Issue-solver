@@ -83,16 +83,28 @@ def callback(request: Request, code: str = "", state: str = ""):
                        data={"client_id": os.environ["GITHUB_CLIENT_ID"],
                              "client_secret": os.environ["GITHUB_CLIENT_SECRET"],
                              "code": code, "redirect_uri": f"{base_url()}/auth/callback"})
-        token = r.json().get("access_token")
+        r.raise_for_status()
+        payload = r.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(502, "GitHub returned an invalid token response")
+        token = payload.get("access_token")
         if not token:
-            raise HTTPException(400, "GitHub did not return a token")
-        gh_user = httpx.get("https://api.github.com/user", timeout=15,
-                            headers={"Authorization": f"Bearer {token}"}).json()
+            raise HTTPException(400, payload.get("error_description") or "GitHub did not return a token")
+        u = httpx.get("https://api.github.com/user", timeout=15,
+                      headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+        u.raise_for_status()
+        gh_user = u.json()
     except httpx.HTTPError:
         raise HTTPException(502, "Could not reach GitHub")
+    except ValueError:
+        raise HTTPException(502, "GitHub returned an invalid response")
+    if not isinstance(gh_user, dict) or not gh_user.get("id") or not gh_user.get("login"):
+        raise HTTPException(502, "GitHub returned an invalid user")
     if not db.get_user(gh_user["id"]):  # match on immutable numeric ID, not username
+        db.audit(None, "login.denied", target=str(gh_user["id"]), detail=str(gh_user["login"]))
         return RedirectResponse("/?error=not_invited")
     db.record_login(gh_user["id"], gh_user["login"], crypto.enc(token))
+    db.audit(db.get_user(gh_user["id"]), "login")
     request.session.clear()  # fresh session on login (prevents fixation)
     request.session.update({"uid": gh_user["id"], "mode": "contributor"})
     return RedirectResponse("/")

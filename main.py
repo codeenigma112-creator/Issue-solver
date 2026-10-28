@@ -1,5 +1,5 @@
 """Run: uvicorn main:app --reload"""
-import logging, os, secrets, sqlite3
+import json, logging, os, secrets, sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -10,12 +10,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-import auth, crypto, db, providers
-from auth import can_maintain, csrf, current_user, effective_mode, gh_for, require_admin, require_maintainer_mode
-from github_client import REPO_RE, GitHub
+import auth, crypto, db, providers, solver
+from auth import (can_maintain, csrf, current_user, effective_mode, gh_for, require_admin,
+                  require_maintainer_mode)
+from github_client import GitHub, valid_repo
 
 log = logging.getLogger("issue_solver")
 STATIC = Path(__file__).parent / "static"
+MAX_JOBS_PER_HOUR = int(os.environ.get("MAX_JOBS_PER_HOUR", "20"))
+MAX_ACTIVE_JOBS = int(os.environ.get("MAX_ACTIVE_JOBS", "2"))
+MAX_KEYS_PER_USER = int(os.environ.get("MAX_KEYS_PER_USER", "10"))
 
 
 def seed_admin():
@@ -23,7 +27,11 @@ def seed_admin():
     if not login:
         log.warning("ADMIN_GITHUB_USERNAME not set; no admin will be seeded")
         return
-    info = GitHub().user_by_login(login)
+    try:
+        info = GitHub().user_by_login(login)
+    except Exception:
+        log.exception("Could not reach GitHub to resolve admin %s", login)
+        return
     if not info:
         log.error("Could not resolve admin username %s", login)
         return
@@ -36,8 +44,10 @@ def seed_admin():
 @asynccontextmanager
 async def lifespan(app):
     db.init()
+    db.fail_stale_jobs()
     seed_admin()
     yield
+    solver.shutdown()
 
 
 SECRET = os.environ.get("SESSION_SECRET")
@@ -58,6 +68,11 @@ async def security_headers(request: Request, call_next):
     resp.headers["Content-Security-Policy"] = ("default-src 'self'; style-src 'self' 'unsafe-inline'; "
                                                "frame-ancestors 'none'")
     resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    if auth.base_url().startswith("https"):
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return resp
 
 
@@ -80,7 +95,8 @@ api = APIRouter(prefix="/api", dependencies=[Depends(csrf)])
 @api.get("/me")
 def me(request: Request, user=Depends(current_user)):
     return {"login": user["login"], "role": user["role"], "can_maintain": can_maintain(user),
-            "mode": effective_mode(request, user)}
+            "mode": effective_mode(request, user),
+            "limits": {"jobs_per_hour": MAX_JOBS_PER_HOUR, "active_jobs": MAX_ACTIVE_JOBS}}
 
 
 class ModeIn(BaseModel):
@@ -92,11 +108,17 @@ def set_mode(body: ModeIn, request: Request, user=Depends(current_user)):
     if body.mode == "maintainer" and not can_maintain(user):
         raise HTTPException(403, "Maintainer access required. Ask the administrator.")
     request.session["mode"] = body.mode
+    db.audit(user, "mode.change", detail=body.mode)
     return {"mode": body.mode}
 
 
 @api.post("/logout")
 def logout(request: Request):
+    uid = request.session.get("uid")
+    user = db.get_user(uid) if uid else None
+    if user:
+        db.clear_token(uid)
+        db.audit(user, "logout")
     request.session.clear()
     return {"ok": True}
 
@@ -123,6 +145,8 @@ def keys(user=Depends(current_user)):
 
 @api.post("/keys")
 def add_key(body: KeyIn, user=Depends(current_user)):
+    if len(db.list_keys(user["github_id"])) >= MAX_KEYS_PER_USER:
+        raise HTTPException(400, f"Key limit reached ({MAX_KEYS_PER_USER})")
     preset = providers.PRESETS.get(body.provider)
     if not preset:
         raise HTTPException(400, "Unknown provider")
@@ -136,14 +160,17 @@ def add_key(body: KeyIn, user=Depends(current_user)):
     ok, msg = providers.validate_key(preset["kind"], base, key)
     if not ok:
         raise HTTPException(400, msg)
-    return {"id": db.add_key(user["github_id"], body.label, body.provider, preset["kind"],
-                             base, body.model, crypto.enc(key))}
+    kid = db.add_key(user["github_id"], body.label, body.provider, preset["kind"],
+                     base, body.model, crypto.enc(key))
+    db.audit(user, "key.add", target=kid, detail=body.provider)
+    return {"id": kid, "message": msg}
 
 
 @api.delete("/keys/{key_id}")
 def delete_key(key_id: str, user=Depends(current_user)):
     if not db.delete_key(user["github_id"], key_id):
         raise HTTPException(404, "Not found")
+    db.audit(user, "key.delete", target=key_id)
     return {"ok": True}
 
 
@@ -151,6 +178,65 @@ def delete_key(key_id: str, user=Depends(current_user)):
 @api.get("/issues")
 def my_issues(user=Depends(current_user)):
     return gh_for(user).assigned_issues()
+
+
+# ---------- jobs ----------
+class JobIn(BaseModel):
+    kind: Literal["solve", "triage", "reply"]
+    repo: str = Field(min_length=3, max_length=140)
+    number: int = Field(gt=0, le=2_000_000_000)
+    key_id: str = Field(min_length=1, max_length=40)
+    instructions: str = Field(default="", max_length=2000)
+    consent: bool = False
+
+
+def _valid_ref(repo: str, number: int):
+    if not valid_repo(repo):
+        raise HTTPException(400, "Bad repo name")
+    if number <= 0 or number > 2_000_000_000:
+        raise HTTPException(400, "Bad issue number")
+
+
+@api.post("/jobs")
+def create_job(body: JobIn, request: Request, user=Depends(current_user)):
+    if not body.consent:
+        raise HTTPException(400, "Confirm that issue content may be sent to your model provider")
+    _valid_ref(body.repo, body.number)
+    if body.kind in ("triage", "reply"):
+        if not can_maintain(user):
+            raise HTTPException(403, "Maintainer access required")
+        if effective_mode(request, user) != "maintainer":
+            raise HTTPException(403, "Switch to maintainer mode first")
+    if not db.get_key(user["github_id"], body.key_id):
+        raise HTTPException(404, "Model key not found")
+    if db.count_jobs_since(user["github_id"], 3600) >= MAX_JOBS_PER_HOUR:
+        raise HTTPException(429, f"Hourly job limit reached ({MAX_JOBS_PER_HOUR})")
+    if db.count_active_jobs(user["github_id"]) >= MAX_ACTIVE_JOBS:
+        raise HTTPException(429, f"Too many running jobs ({MAX_ACTIVE_JOBS})")
+    payload = json.dumps({"repo": body.repo, "number": body.number, "key_id": body.key_id,
+                          "instructions": body.instructions})
+    jid = db.create_job(user["github_id"], body.kind, payload)
+    db.audit(user, "job.create", target=jid, detail=f"{body.kind} {body.repo}#{body.number}")
+    try:
+        solver.submit(jid)
+    except RuntimeError:
+        db.set_job(jid, "error", error="Job runner is shutting down")
+        raise HTTPException(503, "Job runner is shutting down")
+    return {"id": jid, "status": "queued"}
+
+
+@api.get("/jobs")
+def jobs(user=Depends(current_user)):
+    return db.list_jobs(user["github_id"])
+
+
+@api.get("/jobs/{job_id}")
+def job_detail(job_id: str, user=Depends(current_user)):
+    job = db.get_job(job_id, user["github_id"])
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return {"id": job["id"], "kind": job["kind"], "status": job["status"], "result": job["result"],
+            "error": job["error"], "created_at": job["created_at"], "updated_at": job["updated_at"]}
 
 
 # ---------- maintainer mode (role + mode both enforced server-side) ----------
@@ -161,12 +247,36 @@ def m_repos(user=Depends(require_maintainer_mode)):
 
 @api.get("/maintainer/issues")
 def m_issues(repo: str, user=Depends(require_maintainer_mode)):
-    if not REPO_RE.match(repo):
+    if not valid_repo(repo):
         raise HTTPException(400, "Bad repo name")
     gh = gh_for(user)
     if not gh.has_push(repo):
         raise HTTPException(403, "You don't have write access to that repo")
     return gh.unassigned_issues(repo)
+
+
+class LabelsIn(BaseModel):
+    repo: str = Field(min_length=3, max_length=140)
+    number: int = Field(gt=0, le=2_000_000_000)
+    labels: list[str] = Field(min_length=1, max_length=5)
+
+
+@api.post("/maintainer/labels")
+def m_labels(body: LabelsIn, user=Depends(require_maintainer_mode)):
+    _valid_ref(body.repo, body.number)
+    labels = list(dict.fromkeys(l.strip() for l in body.labels if l.strip()))[:5]
+    if not labels:
+        raise HTTPException(400, "No labels selected")
+    gh = gh_for(user)
+    if not gh.has_push(body.repo):
+        raise HTTPException(403, "You don't have write access to that repo")
+    allowed = set(gh.repo_labels(body.repo))
+    unknown = [l for l in labels if l not in allowed]
+    if unknown:
+        raise HTTPException(400, "Unknown labels: " + ", ".join(unknown))
+    applied = gh.add_labels(body.repo, body.number, labels)
+    db.audit(user, "labels.apply", target=f"{body.repo}#{body.number}", detail=", ".join(applied))
+    return {"labels": applied}
 
 
 # ---------- admin ----------
@@ -193,6 +303,7 @@ def admin_add(body: AddUser, admin=Depends(require_admin)):
         db.add_user(info["id"], info["login"], body.role, admin["login"])
     except sqlite3.IntegrityError:
         raise HTTPException(409, "User already added")
+    db.audit(admin, "admin.user.add", target=str(info["id"]), detail=f"{info['login']} {body.role}")
     return {"login": info["login"], "github_id": info["id"]}
 
 
@@ -209,15 +320,25 @@ def _guard_last_admin(target_id: int, admin: dict):
 @api.patch("/admin/users/{github_id}")
 def admin_role(github_id: int, body: RoleIn, admin=Depends(require_admin)):
     _guard_last_admin(github_id, admin)
+    target = db.get_user(github_id)
     db.set_role(github_id, body.role)
+    db.audit(admin, "admin.user.role", target=str(github_id),
+             detail=f"{target['login']} {target['role']}->{body.role}")
     return {"ok": True}
 
 
 @api.delete("/admin/users/{github_id}")
 def admin_remove(github_id: int, admin=Depends(require_admin)):
     _guard_last_admin(github_id, admin)
-    db.remove_user(github_id)  # keys cascade-delete; their session dies on next request
+    target = db.get_user(github_id)
+    db.remove_user(github_id)
+    db.audit(admin, "admin.user.remove", target=str(github_id), detail=target["login"])
     return {"ok": True}
+
+
+@api.get("/admin/audit")
+def admin_audit(admin=Depends(require_admin)):
+    return db.list_audit()
 
 
 app.include_router(api)

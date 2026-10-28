@@ -23,15 +23,21 @@ def assert_public_https(url: str) -> None:
     p = urlparse(url)
     if p.scheme != "https" or not p.hostname:
         raise ValueError("Base URL must start with https://")
+    if p.username or p.password:
+        raise ValueError("Base URL must not contain credentials")
     if os.environ.get("ALLOW_PRIVATE_BASE_URLS") == "1":  # e.g. self-hosted local models
         return
     try:
-        infos = socket.getaddrinfo(p.hostname, p.port or 443)
-    except socket.gaierror:
+        port = p.port or 443
+        infos = socket.getaddrinfo(p.hostname, port)
+    except (socket.gaierror, ValueError):
         raise ValueError("Base URL host could not be resolved")
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
             raise ValueError("Base URL must point to a public host")
 
 
@@ -45,4 +51,6 @@ def validate_key(kind: str, base_url: str, api_key: str) -> tuple[bool, str]:
         return True, "key accepted"
     if r.status_code in (401, 403):
         return False, "provider rejected the key"
+    if r.status_code in (404, 405):
+        return True, "endpoint does not expose /models; key stored unverified"
     return False, f"unexpected status {r.status_code}"
