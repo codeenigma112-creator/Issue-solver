@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Issue Solver</title>
+<style>
+:root{--bg:#0a0a0a;--card:#141414;--line:#262626;--fg:#e8e8e8;--dim:#8a8a8a;--accent:#46e07a}
+body[data-mode=maintainer]{--accent:#f5a524}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Menlo,Consolas,monospace}
+header{display:flex;align-items:center;gap:16px;padding:12px 20px;border-bottom:1px solid var(--line)}
+.brand{font-weight:700;color:var(--accent);letter-spacing:.08em}.sp{flex:1}.dim{color:var(--dim)}
+main{max-width:1100px;margin:0 auto;padding:20px;display:grid;gap:16px;grid-template-columns:1fr 1.4fr}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+.card.wide{grid-column:1/-1}h2{margin:0 0 12px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+input,select,button{font:inherit;color:var(--fg);background:#0e0e0e;border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+button{cursor:pointer;background:var(--accent);color:#000;border:0;font-weight:700}button.ghost{background:none;color:var(--fg);border:1px solid var(--line)}
+.form{display:grid;gap:8px;margin-top:12px}.row{display:flex;gap:8px;align-items:center}.row>*{flex:1}.row>button{flex:0}
+.item{padding:10px 0;border-top:1px solid var(--line)}.item a{color:var(--fg)}.tag{font-size:11px;border:1px solid var(--line);border-radius:4px;padding:1px 6px;margin-right:4px;color:var(--dim)}
+.mode{display:flex;gap:8px;align-items:center;color:var(--dim)}.mode input{width:38px;height:20px;accent-color:var(--accent)}
+#login{max-width:420px;margin:15vh auto;text-align:center}#login .card{padding:32px}
+#toast{position:fixed;bottom:20px;right:20px;background:#3a1212;border:1px solid #7a2a2a;padding:10px 14px;border-radius:8px}
+[hidden]{display:none!important}
+</style></head>
+<body data-mode="contributor">
+<header id="top" hidden>
+  <span class="brand">ISSUE SOLVER</span><span class="sp"></span>
+  <label class="mode" id="modeWrap" hidden>Contributor <input type="checkbox" id="mode"> Maintainer</label>
+  <span id="who" class="dim"></span><button class="ghost" id="logout">Sign out</button>
+</header>
+
+<div id="login" hidden><div class="card">
+  <h2>Issue Solver</h2>
+  <p class="dim" id="loginMsg">Access is invite-only. Sign in with the GitHub account the administrator added.</p>
+  <a href="/auth/login"><button>Sign in with GitHub</button></a>
+</div></div>
+
+<main id="app" hidden>
+  <section class="card"><h2>AI model keys</h2><div id="keys"></div>
+    <div class="form">
+      <select id="provider"></select>
+      <input id="label" placeholder="Label (e.g. My OpenRouter key)">
+      <input id="baseUrl" placeholder="Base URL (https://…)" hidden>
+      <input id="model" placeholder="Model">
+      <input id="apiKey" type="password" placeholder="API key" autocomplete="off">
+      <button id="saveKey">Validate &amp; save</button>
+    </div></section>
+  <section class="card" id="work"></section>
+  <section class="card wide" id="adminCard" hidden><h2>Admin: users</h2>
+    <div class="row"><input id="newUser" placeholder="GitHub username"><select id="newRole"><option>contributor</option><option>maintainer</option><option>admin</option></select><button id="addUser">Add</button></div>
+    <div id="users"></div></section>
+</main>
+<div id="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body></html>
