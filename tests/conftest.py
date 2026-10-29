@@ -9,3 +9,5 @@ os.environ.pop("ALLOW_PRIVATE_BASE_URLS", None)
 from cryptography.fernet import Fernet
 
 os.environ["ISSUE_SOLVER_MASTER_KEY"] = Fernet.generate_key().decode()
+os.environ["SOLVE_CI_WAIT"] = "0"
+os.environ["SOLVE_CI_FIX_ATTEMPTS"] = "0"

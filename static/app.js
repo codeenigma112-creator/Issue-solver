@@ -1,5 +1,6 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const linkify = s => esc(s).replace(/(https:\/\/github\.com\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
 const show = (s, on) => { $(s).hidden = !on; };
 let me = null, providers = {}, myKeys = [], pollTimer = null, lastJob = null;
 
@@ -15,18 +16,29 @@ async function api(path, method = 'GET', body) {
 }
 
 function showLogin() {
-  show('#login', true); show('#app', false); show('#top', false);
+  show('#login', true); show('#app', false);
   if (new URLSearchParams(location.search).get('error') === 'not_invited')
     $('#loginMsg').textContent = "That GitHub account hasn't been added yet. Ask the administrator to add your username.";
 }
 
+function showView(name) {
+  document.querySelectorAll('.view').forEach(v => show('#' + v.id, v.id === 'view-' + name));
+  document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+  if (name === 'keys') loadKeys();
+  if (name === 'users') loadUsers();
+  if (name === 'audit') loadAudit();
+}
+
 async function init() {
   try { me = await api('/me'); } catch { return; }
-  show('#login', false); show('#app', true); show('#top', true);
+  show('#login', false); show('#app', true);
   document.body.dataset.mode = me.mode;
   $('#who').textContent = '@' + me.login + ' · ' + me.role;
   show('#modeWrap', me.can_maintain); $('#mode').checked = me.mode === 'maintainer';
-  show('#adminCard', me.role === 'admin'); show('#auditCard', me.role === 'admin');
+  document.querySelectorAll('.admin-only').forEach(el => { el.hidden = true; });
+  if (me.role === 'admin') {
+    document.querySelectorAll('.admin-only').forEach(el => { el.hidden = false; });
+  }
   if (!Object.keys(providers).length) {
     providers = await api('/providers');
     $('#provider').innerHTML = Object.keys(providers).map(p => `<option>${esc(p)}</option>`).join('');
@@ -34,6 +46,7 @@ async function init() {
   }
   await loadKeys();
   renderWork();
+  showView('dashboard');
   if (me.role === 'admin') { loadUsers(); loadAudit(); }
 }
 
@@ -58,6 +71,7 @@ async function saveKey() {
   const res = await api('/keys', 'POST', { provider: $('#provider').value, label: $('#label').value || 'My key',
     base_url: $('#baseUrl').value, model: $('#model').value, api_key: $('#apiKey').value });
   $('#apiKey').value = ''; await loadKeys(); renderWork(); toast(res.message || 'Key validated and saved');
+  showView('keys');
 }
 
 function renderWork() {
@@ -78,19 +92,22 @@ function renderIssues(items) {
     const actions = isM
       ? `<div class="actions"><button class="small" data-action="triage" data-repo="${esc(i.repo)}" data-num="${esc(i.number)}">Triage labels</button><button class="small ghost" data-action="reply" data-repo="${esc(i.repo)}" data-num="${esc(i.number)}">Draft reply</button></div>`
       : `<div class="actions"><button class="small" data-action="solve" data-repo="${esc(i.repo)}" data-num="${esc(i.number)}">Solve issue</button></div>`;
-    return `<div class="item"><a href="${esc(link)}" target="_blank" rel="noopener noreferrer">${esc(i.repo)}#${esc(i.number)}</a><br>${esc(i.title)}<br>${i.labels.map(l => `<span class="tag">${esc(l)}</span>`).join('')}${actions}</div>`;
+    const tags = i.labels.map(l => `<span class="tag">${esc(l)}</span>`).join('') || '<span class="dim">No labels</span>';
+    const prs = Array.isArray(i.linked_prs) ? i.linked_prs : (i.has_pr ? [i.number] : []);
+    const pr = prs.map(p => `<a class="tag pr" title="Pull request linked to this issue" href="https://github.com/${esc(i.repo)}/pull/${esc(p)}" target="_blank" rel="noopener noreferrer">PR #${esc(p)}</a>`).join('');
+    return `<div class="item"><div class="issue-title">${esc(i.title)}</div><div class="issue-meta"><a href="${esc(link)}" target="_blank" rel="noopener noreferrer">${esc(i.repo)}#${esc(i.number)}</a><span class="tags">${pr}${tags}</span></div>${actions}</div>`;
   }).join('') : '<p class="dim">Nothing here.</p>';
 }
 
 async function startJob(kind, repo, number) {
   const keyId = $('#keySel') ? $('#keySel').value : '';
-  if (!keyId) { toast('Add and select a model key first'); return; }
+  if (!keyId) { toast('Add and select a model key first'); showView('keys'); return; }
   if (!repo || !number) { toast('Load an issue first'); return; }
   const key = myKeys.find(k => k.id === keyId);
   const provider = key ? key.provider : 'your provider';
-  if (!confirm(`This sends the issue content to ${provider} using your key. Continue?`)) return;
+  if (!confirm(`This sends the issue content to ${provider} using your key, then pushes the model's changes and opens a pull request. Continue?`)) return;
   lastJob = null;
-  $('#jobOut').innerHTML = '<div class="out"><span class="status">Queued…</span></div>';
+  $('#jobOut').innerHTML = '<div class="out"><span class="status pending">Queued…</span></div>';
   const job = await api('/jobs', 'POST', { kind, repo, number: Number(number), key_id: keyId,
     instructions: $('#instructions') ? $('#instructions').value : '', consent: true });
   pollJob(job.id, repo, number);
@@ -107,12 +124,12 @@ async function pollJob(id, repo, number) {
 function renderJob(job, repo, number) {
   const out = $('#jobOut');
   if (job.status === 'queued' || job.status === 'running') {
-    out.innerHTML = `<div class="out"><span class="status">${esc(job.status)}…</span><p class="dim">This can take a little while. Keep this page open.</p></div>`;
+    out.innerHTML = `<div class="out"><span class="status pending">${esc(job.status)}…</span><p class="dim">This can take a little while. Keep this page open.</p></div>`;
     return;
   }
   lastJob = job;
   if (job.status === 'error') {
-    out.innerHTML = `<div class="out"><span class="status">Failed</span><pre>${esc(job.error || 'Unknown error')}</pre></div>`;
+    out.innerHTML = `<div class="out"><span class="status bad">Failed</span><pre>${esc(job.error || 'Unknown error')}</pre><div class="actions"><button class="small" data-action="retry" data-kind="${esc(job.kind)}" data-repo="${esc(repo)}" data-num="${esc(number)}">Retry</button></div></div>`;
     return;
   }
   if (job.kind === 'triage') {
@@ -123,7 +140,9 @@ function renderJob(job, repo, number) {
       || '<span class="dim">No confident labels suggested.</span>';
     out.innerHTML = `<div class="out"><span class="status">Triage suggestions</span><p class="dim">${esc(data.rationale || '')}</p><div class="actions">${boxes}</div><div class="actions"><button class="small" data-action="apply" data-repo="${esc(repo)}" data-num="${esc(number)}">Apply selected labels</button></div></div>`;
   } else {
-    out.innerHTML = `<div class="out"><span class="status">${job.kind === 'reply' ? 'Reply draft' : 'Solution draft'}</span><pre>${esc(job.result || '')}</pre><div class="actions"><button class="small ghost" data-action="copy">Copy</button></div></div>`;
+    const status = job.kind === 'reply' ? 'Reply draft'
+      : (String(job.result || '').startsWith('Opened pull request:') ? 'Pull request opened' : 'Solution draft');
+    out.innerHTML = `<div class="out"><span class="status">${status}</span><p class="dim">AI-generated and unverified. Issue text can steer the model, so read every line before you apply or post it.</p><pre>${linkify(job.result || '')}</pre><div class="actions"><button class="small ghost" data-action="copy">Copy</button></div></div>`;
   }
 }
 
@@ -165,8 +184,10 @@ document.addEventListener('click', async e => {
     else if (b.dataset.action === 'solve') await startJob('solve', b.dataset.repo, b.dataset.num);
     else if (b.dataset.action === 'triage') await startJob('triage', b.dataset.repo, b.dataset.num);
     else if (b.dataset.action === 'reply') await startJob('reply', b.dataset.repo, b.dataset.num);
+    else if (b.dataset.action === 'retry') await startJob(b.dataset.kind, b.dataset.repo, b.dataset.num);
     else if (b.dataset.action === 'apply') await applyLabels(b);
     else if (b.dataset.action === 'copy') { await navigator.clipboard.writeText(lastJob ? lastJob.result || '' : ''); toast('Copied'); }
+    else if (b.classList.contains('nav-item')) showView(b.dataset.view);
   } catch (err) { toast(err.message); }
 });
 

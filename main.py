@@ -13,6 +13,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import auth, crypto, db, providers, solver
 from auth import (can_maintain, csrf, current_user, effective_mode, gh_for, require_admin,
                   require_maintainer_mode)
+import github_client
 from github_client import GitHub, valid_repo
 
 log = logging.getLogger("issue_solver")
@@ -20,6 +21,8 @@ STATIC = Path(__file__).parent / "static"
 MAX_JOBS_PER_HOUR = int(os.environ.get("MAX_JOBS_PER_HOUR", "20"))
 MAX_ACTIVE_JOBS = int(os.environ.get("MAX_ACTIVE_JOBS", "2"))
 MAX_KEYS_PER_USER = int(os.environ.get("MAX_KEYS_PER_USER", "10"))
+JOB_RETENTION_DAYS = int(os.environ.get("JOB_RETENTION_DAYS", "30"))      # 0 = keep forever
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "180"))  # 0 = keep forever
 
 
 def seed_admin():
@@ -45,9 +48,11 @@ def seed_admin():
 async def lifespan(app):
     db.init()
     db.fail_stale_jobs()
+    db.maybe_purge(JOB_RETENTION_DAYS, AUDIT_RETENTION_DAYS)
     seed_admin()
     yield
     solver.shutdown()
+    github_client.close_client()
 
 
 SECRET = os.environ.get("SESSION_SECRET")
@@ -114,10 +119,11 @@ def set_mode(body: ModeIn, request: Request, user=Depends(current_user)):
 
 @api.post("/logout")
 def logout(request: Request):
-    uid = request.session.get("uid")
-    user = db.get_user(uid) if uid else None
+    user = auth.session_user(request)  # a stale cookie must not be able to log the real user out
     if user:
-        db.clear_token(uid)
+        auth.revoke_github_token(user.get("gh_token"))
+        db.clear_token(user["github_id"])
+        db.bump_session_epoch(user["github_id"])
         db.audit(user, "logout")
     request.session.clear()
     return {"ok": True}
@@ -209,13 +215,15 @@ def create_job(body: JobIn, request: Request, user=Depends(current_user)):
             raise HTTPException(403, "Switch to maintainer mode first")
     if not db.get_key(user["github_id"], body.key_id):
         raise HTTPException(404, "Model key not found")
-    if db.count_jobs_since(user["github_id"], 3600) >= MAX_JOBS_PER_HOUR:
-        raise HTTPException(429, f"Hourly job limit reached ({MAX_JOBS_PER_HOUR})")
-    if db.count_active_jobs(user["github_id"]) >= MAX_ACTIVE_JOBS:
-        raise HTTPException(429, f"Too many running jobs ({MAX_ACTIVE_JOBS})")
     payload = json.dumps({"repo": body.repo, "number": body.number, "key_id": body.key_id,
                           "instructions": body.instructions})
-    jid = db.create_job(user["github_id"], body.kind, payload)
+    db.maybe_purge(JOB_RETENTION_DAYS, AUDIT_RETENTION_DAYS)
+    jid, blocked = db.create_job_limited(user["github_id"], body.kind, payload,
+                                         MAX_JOBS_PER_HOUR, MAX_ACTIVE_JOBS)  # atomic check + insert
+    if blocked == "hourly":
+        raise HTTPException(429, f"Hourly job limit reached ({MAX_JOBS_PER_HOUR})")
+    if blocked == "active":
+        raise HTTPException(429, f"Too many running jobs ({MAX_ACTIVE_JOBS})")
     db.audit(user, "job.create", target=jid, detail=f"{body.kind} {body.repo}#{body.number}")
     try:
         solver.submit(jid)
@@ -331,6 +339,7 @@ def admin_role(github_id: int, body: RoleIn, admin=Depends(require_admin)):
 def admin_remove(github_id: int, admin=Depends(require_admin)):
     _guard_last_admin(github_id, admin)
     target = db.get_user(github_id)
+    auth.revoke_github_token(target.get("gh_token"))
     db.remove_user(github_id)
     db.audit(admin, "admin.user.remove", target=str(github_id), detail=target["login"])
     return {"ok": True}

@@ -1,5 +1,5 @@
 """GitHub OAuth login gated by the admin's allowlist + FastAPI auth dependencies."""
-import os, secrets
+import logging, os, secrets
 from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -7,6 +7,7 @@ from fastapi.responses import RedirectResponse
 import crypto, db
 from github_client import GitHub
 
+log = logging.getLogger("issue_solver.auth")
 router = APIRouter(prefix="/auth")
 
 
@@ -24,9 +25,18 @@ def csrf(request: Request):
         raise HTTPException(403, "Missing CSRF header")
 
 
-def current_user(request: Request) -> dict:
+def session_user(request: Request) -> dict | None:
+    """The signed-in user, or None. The cookie is signed but stateless, so it also carries the
+    user's session_epoch; logout bumps the epoch, which kills every copy of the old cookie."""
     uid = request.session.get("uid")
     user = db.get_user(uid) if uid else None  # re-read every request => removal takes effect instantly
+    if user and request.session.get("epoch") != user["session_epoch"]:
+        return None
+    return user
+
+
+def current_user(request: Request) -> dict:
+    user = session_user(request)
     if not user:
         request.session.clear()
         raise HTTPException(401, "Not signed in")
@@ -52,6 +62,19 @@ def require_maintainer_mode(request: Request, user: dict = Depends(current_user)
     if effective_mode(request, user) != "maintainer":
         raise HTTPException(403, "Switch to maintainer mode first")
     return user
+
+
+def revoke_github_token(enc_token: str | None) -> None:
+    """Best-effort: invalidate the OAuth token at GitHub itself, not just forget it locally."""
+    cid, secret = os.environ.get("GITHUB_CLIENT_ID"), os.environ.get("GITHUB_CLIENT_SECRET")
+    if not (enc_token and cid and secret):
+        return
+    try:
+        httpx.request("DELETE", f"https://api.github.com/applications/{cid}/token", timeout=10,
+                      auth=(cid, secret), headers={"Accept": "application/vnd.github+json"},
+                      json={"access_token": crypto.dec(enc_token)})
+    except Exception:  # never block logout / removal on GitHub being unreachable
+        log.warning("Could not revoke GitHub token", exc_info=True)
 
 
 def gh_for(user: dict) -> GitHub:
@@ -101,10 +124,19 @@ def callback(request: Request, code: str = "", state: str = ""):
     if not isinstance(gh_user, dict) or not gh_user.get("id") or not gh_user.get("login"):
         raise HTTPException(502, "GitHub returned an invalid user")
     if not db.get_user(gh_user["id"]):  # match on immutable numeric ID, not username
-        db.audit(None, "login.denied", target=str(gh_user["id"]), detail=str(gh_user["login"]))
-        return RedirectResponse("/?error=not_invited")
+        # First-run bootstrap: if no admin exists yet and GitHub just verified that the person signing
+        # in is ADMIN_GITHUB_USERNAME, make them the admin. Needs no GitHub lookup, so it can't fail
+        # on rate limits the way the startup seeding can.
+        boot = os.environ.get("ADMIN_GITHUB_USERNAME", "").strip().lstrip("@").lower()
+        if boot and gh_user["login"].lower() == boot and db.count_admins() == 0:
+            db.add_user(gh_user["id"], gh_user["login"], "admin", "bootstrap")
+            db.audit(None, "admin.bootstrap", target=str(gh_user["id"]), detail=str(gh_user["login"]))
+        else:
+            db.audit(None, "login.denied", target=str(gh_user["id"]), detail=str(gh_user["login"]))
+            return RedirectResponse("/?error=not_invited")
     db.record_login(gh_user["id"], gh_user["login"], crypto.enc(token))
-    db.audit(db.get_user(gh_user["id"]), "login")
+    user = db.get_user(gh_user["id"])
+    db.audit(user, "login")
     request.session.clear()  # fresh session on login (prevents fixation)
-    request.session.update({"uid": gh_user["id"], "mode": "contributor"})
+    request.session.update({"uid": gh_user["id"], "mode": "contributor", "epoch": user["session_epoch"]})
     return RedirectResponse("/")

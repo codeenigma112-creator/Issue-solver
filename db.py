@@ -1,5 +1,5 @@
 """SQLite storage: allowlisted users (by GitHub ID), encrypted model keys, jobs, and audit log."""
-import os, sqlite3, uuid
+import os, sqlite3, time, uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL DEFAULT 'contributor' CHECK (role IN ('contributor','maintainer','admin')),
   added_by TEXT,
   last_login TEXT,
-  gh_token TEXT
+  gh_token TEXT,
+  session_epoch INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS keys (
   id TEXT PRIMARY KEY,
@@ -64,6 +65,10 @@ def init():
     with conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
+        # Migrate databases created before session_epoch existed.
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
+        if "session_epoch" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
     try:
         os.chmod(HOME, 0o700)
         os.chmod(HOME / "app.db", 0o600)
@@ -116,6 +121,12 @@ def clear_token(github_id):
         c.execute("UPDATE users SET gh_token=NULL WHERE github_id=?", (github_id,))
 
 
+def bump_session_epoch(github_id):
+    """Invalidate every signed session cookie issued for this user."""
+    with conn() as c:
+        c.execute("UPDATE users SET session_epoch=session_epoch+1 WHERE github_id=?", (github_id,))
+
+
 def add_key(user_id, label, provider, kind, base_url, model, enc_key):
     kid = uuid.uuid4().hex[:8]
     with conn() as c:
@@ -146,6 +157,28 @@ def create_job(user_id, kind, input_json):
         c.execute("INSERT INTO jobs(id, user_id, kind, input) VALUES (?,?,?,?)",
                   (jid, user_id, kind, input_json))
     return jid
+
+
+def create_job_limited(user_id, kind, input_json, max_per_hour, max_active):
+    """Check the per-user limits and insert the job in ONE write transaction.
+
+    BEGIN IMMEDIATE takes SQLite's write lock before counting, so two simultaneous requests
+    can't both see "room for one more". Returns (job_id, None) or (None, "hourly" | "active").
+    """
+    jid = uuid.uuid4().hex
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        recent = c.execute("SELECT COUNT(*) FROM jobs WHERE user_id=? AND created_at >= datetime('now', '-3600 seconds')",
+                           (user_id,)).fetchone()[0]
+        if recent >= max_per_hour:
+            return None, "hourly"
+        active = c.execute("SELECT COUNT(*) FROM jobs WHERE user_id=? AND status IN ('queued','running')",
+                           (user_id,)).fetchone()[0]
+        if active >= max_active:
+            return None, "active"
+        c.execute("INSERT INTO jobs(id, user_id, kind, input) VALUES (?,?,?,?)",
+                  (jid, user_id, kind, input_json))
+    return jid, None
 
 
 def set_job(job_id, status, result=None, error=None):
@@ -186,6 +219,33 @@ def fail_stale_jobs():
     with conn() as c:
         c.execute("UPDATE jobs SET status='error', error='Interrupted by restart', updated_at=datetime('now') "
                   "WHERE status IN ('queued','running')")
+
+
+_last_purge = float("-inf")
+
+
+def purge_old(job_days: int, audit_days: int) -> tuple[int, int]:
+    """Delete finished jobs and audit rows older than the given ages (0 = keep forever).
+    Queued/running jobs are never touched."""
+    jobs = logs = 0
+    with conn() as c:
+        if job_days > 0:
+            jobs = c.execute("DELETE FROM jobs WHERE status NOT IN ('queued','running') "
+                             "AND updated_at < datetime('now', ?)", (f"-{int(job_days)} days",)).rowcount
+        if audit_days > 0:
+            logs = c.execute("DELETE FROM audit WHERE ts < datetime('now', ?)",
+                             (f"-{int(audit_days)} days",)).rowcount
+    return jobs, logs
+
+
+def maybe_purge(job_days: int, audit_days: int, every_seconds: int = 3600) -> None:
+    """Cheap, rate-limited purge so long-running servers clean up without a scheduler."""
+    global _last_purge
+    now = time.monotonic()
+    if now - _last_purge < every_seconds:
+        return
+    _last_purge = now
+    purge_old(job_days, audit_days)
 
 
 def audit(actor, action, target=None, detail=None):
