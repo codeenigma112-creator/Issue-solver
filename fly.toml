@@ -1,0 +1,33 @@
+app = "issue-solver-enigma112"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ISSUE_SOLVER_HOME = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[mounts]]
+  source = "issue_solver_data"
+  destination = "/data"
+
+[checks.alive]
+  type = "http"
+  port = 8000
+  path = "/"
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
